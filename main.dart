@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
@@ -26,6 +27,7 @@ class Printer {
   final String name, host;
   int? ippPort, scanPort;
   String ippPath = 'ipp/print', scanPath = 'eSCL', scanScheme = 'http';
+  String scanProtocol = 'escl'; // escl ya epsonds
   final formats = <String>{}; // printer jo file types leta hai
   Printer(this.name, this.host);
   bool get canPrint => ippPort != null;
@@ -78,12 +80,14 @@ Future<List<Printer>> discover() async {
     await _browse(client, '_uscan._tcp.local', 'rs', (n, h, port, path) {
       final p = byHost.putIfAbsent(h, () => Printer(n, h));
       p.scanPort = port;
+      p.scanProtocol = 'escl';
       if (path.isNotEmpty) p.scanPath = path;
     });
     await _browse(client, '_uscans._tcp.local', 'rs', (n, h, port, path) {
       final p = byHost.putIfAbsent(h, () => Printer(n, h));
       if (!p.canScan) {
         p.scanPort = port;
+        p.scanProtocol = 'escl';
         p.scanScheme = 'https';
         if (path.isNotEmpty) p.scanPath = path;
       }
@@ -94,6 +98,11 @@ Future<List<Printer>> discover() async {
   await Future.wait(byHost.values.map((p) async {
     try { if (p.canPrint) await probeIpp(p); } catch (_) {}
     try { await probeScan(p); } catch (_) {}
+    if (!p.canScan && await _portOpen(p.host, 1865)) {
+      p.scanPort = 1865;
+      p.scanProtocol = 'epsonds';
+      p.scanPath = '';
+    }
   }));
   return byHost.values.toList();
 }
@@ -248,6 +257,7 @@ Future<void> probeScan(Printer p) async {
             .timeout(const Duration(seconds: 3));
         if (r.statusCode == 200 && r.body.contains('ScannerCapabilities')) {
           p.scanScheme = t.$1;
+          p.scanProtocol = 'escl';
           p.scanPort = t.$2;
           p.scanPath = path;
           return;
@@ -262,6 +272,11 @@ Future<Printer?> addByIp(String ip) async {
   final p = Printer('Printer $ip', ip)..ippPort = 631;
   if (!await probeIpp(p)) p.ippPort = null;
   await probeScan(p);
+  if (!p.canScan && await _portOpen(p.host, 1865)) {
+    p.scanPort = 1865;
+    p.scanProtocol = 'epsonds';
+    p.scanPath = '';
+  }
   return (p.canPrint || p.canScan) ? p : null;
 }
 
@@ -299,6 +314,11 @@ Future<List<Printer>> scanNetwork() async {
         final p = Printer('Printer $h', h)..ippPort = 631;
         if (!await probeIpp(p)) p.ippPort = null;
         await probeScan(p);
+        if (!p.canScan && await _portOpen(p.host, 1865)) {
+          p.scanPort = 1865;
+          p.scanProtocol = 'epsonds';
+          p.scanPath = '';
+        }
         found.add(p);
       } else if (await _portOpen(h, 9100)) {
         // sirf RAW port khula hai: printer hai, par abhi app isse print nahi kar sakti
@@ -329,7 +349,7 @@ Future<String> diagnose(Printer p) async {
     b.writeln('${e.value ? "✓" : "✗"}  ${e.key}  ${checks[e.key]}');
   }
   b.writeln('\nPrint (IPP): ${p.canPrint ? "✓" : "✗"}');
-  b.writeln('Scan (eSCL): ${p.canScan ? "✓ ${p.scanScheme}:${p.scanPort}" : "✗ nahi mila"}');
+  b.writeln('Scan protocol: ${p.canScan ? "✓ ${p.scanProtocol} port ${p.scanPort}" : "✗ nahi mila"}');
   return b.toString();
 }
 
@@ -381,6 +401,59 @@ Future<Uint8List> scanPage(Printer p) async {
     throw Exception('Scan nahi hua (${r.statusCode})');
   }
   throw Exception('Timeout: scan nahi aaya');
+}
+
+// ---------- Epson ESC/I-2 network probe (SANE epsonds-net.c ke framing ke mutabiq) ----------
+// Yeh sirf INFO command bhejta hai; scan start ya parameters change nahi karta.
+// INFO payload SANE epsonds-cmd.c: "INFOx0000000" (12 ASCII bytes).
+String _hexBytes(List<int> bytes, {int max = 256}) {
+  final shown = bytes.take(max).map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+  return bytes.length > max ? '$shown ... (${bytes.length} bytes total)' : shown;
+}
+
+Future<String> epsondsInfoProbe(String host) async {
+  final socket = await Socket.connect(host, 1865,
+      timeout: const Duration(seconds: 4));
+  final payload = ascii.encode('INFOx0000000');
+  final packet = BytesBuilder();
+  // 12-byte IS network header, packet type 0x20 (passthrough), data type 0x00.
+  packet.add([0x49, 0x53, 0x20, 0x00, 0x00, 0x0c,
+    0x00, 0x00, 0x00, 0x14, 0x00, 0x00]);
+  // 8-byte data header: payload length 12, expected reply length 0.
+  packet.add([0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00]);
+  packet.add(payload);
+  socket.add(packet.toBytes());
+  await socket.flush();
+
+  final result = <int>[];
+  try {
+    await for (final chunk in socket.timeout(const Duration(seconds: 5))) {
+      result.addAll(chunk);
+      // Header is 12 bytes; bytes 6..9 contain big-endian payload size.
+      if (result.length >= 12) {
+        if (result[0] != 0x49 || result[1] != 0x53) {
+          break;
+        }
+        final size = (result[6] << 24) |
+            (result[7] << 16) | (result[8] << 8) | result[9];
+        if (size > 65536) {
+          result.addAll(ascii.encode('\nInvalid/too-large response length: $size'));
+          break;
+        }
+        if (result.length >= 12 + size) break;
+      }
+    }
+  } on TimeoutException {
+    // Return partial bytes so the UI can show whether the device answered.
+  } finally {
+    socket.destroy();
+  }
+  if (result.isEmpty) {
+    return 'Port 1865 connect hua, lekin INFO ka koi reply bytes nahi aaye.';
+  }
+  return 'Sent ASCII: INFOx0000000\n'
+      'Received ${result.length} bytes:\n${_hexBytes(result, max: 512)}\n\n'
+      'Note: yeh INFO protocol probe hai, full scan nahi.';
 }
 
 Future<Uint8List> jpegToPdf(Uint8List jpg) async {
@@ -475,6 +548,16 @@ class _HomePageState extends State<HomePage> {
     if (p == null) return;
     setState(() { busy = true; status = 'Scan ho raha hai... (page glass par rakho)'; });
     try {
+      if (p.scanProtocol == 'epsonds') {
+        final info = await epsondsInfoProbe(p.host);
+        if (mounted) showDialog(context: context, builder: (ctx) => AlertDialog(
+          title: const Text('Epson ESC/I-2 raw test'),
+          content: SingleChildScrollView(child: SelectableText(info)),
+          actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK'))],
+        ));
+        setState(() { busy = false; status = 'ESC/I-2 INFO test complete; yeh abhi scan nahi hai.'; });
+        return;
+      }
       final img = await scanPage(p);
       setState(() { scanned = img; status = 'Scan ho gaya ✅'; });
     } catch (e) {
@@ -484,7 +567,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> doCopy() async {
-    final p = need((p) => p.canScan && p.canPrint, 'Copy (scan + print)');
+    final p = need((p) => p.canScan && p.scanProtocol != 'epsonds' && p.canPrint, 'Copy (eSCL scan + print; Epson ESC/I-2 scan abhi experimental hai)');
     if (p == null) return;
     setState(() { busy = true; status = 'Scan ho raha hai... (page glass par rakho)'; });
     try {
@@ -672,6 +755,25 @@ class _HomePageState extends State<HomePage> {
       appBar: AppBar(
         title: const Text('Wi-Fi Print & Scan'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.science_outlined),
+            tooltip: 'Epson ESC/I-2 raw INFO test',
+            onPressed: busy || selected == null ? null : () async {
+              final p = selected!;
+              setState(() { busy = true; status = 'ESC/I-2 INFO probe...'; });
+              try {
+                final out = await epsondsInfoProbe(p.host);
+                if (!mounted) return;
+                showDialog(context: context, builder: (ctx) => AlertDialog(
+                  title: Text('ESC/I-2 test: ${p.host}'),
+                  content: SingleChildScrollView(child: SelectableText(out)),
+                  actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK'))],
+                ));
+                setState(() => status = 'ESC/I-2 raw test complete');
+              } catch (e) { setState(() => status = 'ESC/I-2 test error: $e'); }
+              finally { if (mounted) setState(() => busy = false); }
+            },
+          ),
           IconButton(
             icon: const Icon(Icons.fact_check_outlined),
             tooltip: 'Printer check',
