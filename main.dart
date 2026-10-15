@@ -11,9 +11,14 @@ import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 
 // Printers ke self-signed https certificate ko accept karne wala client
-final http.Client _insecure = IOClient(HttpClient()
-  ..badCertificateCallback = (cert, host, port) => true
-  ..connectionTimeout = const Duration(seconds: 5));
+HttpClient _makeClient() {
+  final c = HttpClient();
+  c.badCertificateCallback = (cert, host, port) => true;
+  c.connectionTimeout = const Duration(seconds: 5);
+  return c;
+}
+
+final http.Client _insecure = IOClient(_makeClient());
 
 void main() => runApp(const MaterialApp(home: HomePage()));
 
