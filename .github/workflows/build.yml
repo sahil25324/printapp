@@ -22,7 +22,7 @@ jobs:
         run: |
           flutter create --platforms=android --project-name wifi_print_scan app
           cd app
-          flutter pub add multicast_dns http file_picker
+          flutter pub add multicast_dns http file_picker:^8.3.7
           cp ../main.dart lib/main.dart
           sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/><uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/><application android:usesCleartextTraffic="true"|' android/app/src/main/AndroidManifest.xml
           flutter build apk --release
