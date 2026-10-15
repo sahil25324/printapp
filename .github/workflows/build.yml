@@ -1,0 +1,33 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Create project, add code, build
+        run: |
+          flutter create --platforms=android --project-name wifi_print_scan app
+          cd app
+          flutter pub add multicast_dns http file_picker
+          cp ../main.dart lib/main.dart
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/><uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/><application android:usesCleartextTraffic="true"|' android/app/src/main/AndroidManifest.xml
+          flutter build apk --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-apk
+          path: app/build/app/outputs/flutter-apk/app-release.apk
