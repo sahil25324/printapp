@@ -13,6 +13,7 @@ class Printer {
   final String name, host;
   int? ippPort, scanPort;
   String ippPath = 'ipp/print', scanPath = 'eSCL';
+  final formats = <String>{}; // printer jo file types leta hai
   Printer(this.name, this.host);
   bool get canPrint => ippPort != null;
   bool get canScan => scanPort != null;
@@ -69,6 +70,10 @@ Future<List<Printer>> discover() async {
   } finally {
     client.stop();
   }
+  await Future.wait(byHost.values.map((p) async {
+    try { if (p.canPrint) await probeIpp(p); } catch (_) {}
+    try { await probeScan(p); } catch (_) {}
+  }));
   return byHost.values.toList();
 }
 
@@ -130,16 +135,110 @@ Future<String?> _sendJob(Printer p, String format, Uint8List bytes) async {
 }
 
 Future<String?> printFile(Printer p, String ext, Uint8List bytes) async {
-  final format = switch (ext.toLowerCase()) {
+  final e = ext.toLowerCase();
+  var format = switch (e) {
     'pdf' => 'application/pdf',
     'png' => 'image/png',
     _ => 'image/jpeg',
   };
-  final first = await _sendJob(p, format, bytes);
+  var data = bytes;
+
+  if (p.formats.isNotEmpty && !p.formats.contains(format)) {
+    if (e != 'pdf' && p.formats.contains('application/pdf')) {
+      data = await jpegToPdf(bytes); // photo ko PDF bana ke bhejo
+      format = 'application/pdf';
+    } else if (p.formats.contains('application/octet-stream')) {
+      format = 'application/octet-stream';
+    } else {
+      return e == 'pdf'
+          ? 'ye printer PDF nahi leta, photo (JPG) bhejo'
+          : 'ye printer is file type ko nahi leta';
+    }
+  }
+
+  final first = await _sendJob(p, format, data);
   if (first == null) return null;
-  // fallback: printer ko khud format pehchanne do
-  final second = await _sendJob(p, 'application/octet-stream', bytes);
-  return second == null ? null : first;
+  if (p.formats.isEmpty) {
+    // printer ne formats nahi bataye: printer ko khud pehchanne do
+    final second = await _sendJob(p, 'application/octet-stream', data);
+    if (second == null) return null;
+  }
+  return first;
+}
+
+// ---------- IPP probe: printer zinda hai? kaun se formats leta hai? ----------
+Uint8List _buildGetAttrs(String uri) {
+  final b = BytesBuilder();
+  b.add([0x01, 0x01, 0x00, 0x0B, 0, 0, 0, 2]); // IPP 1.1, Get-Printer-Attributes
+  b.addByte(0x01);
+  void attr(int tag, String name, String value) {
+    final n = utf8.encode(name), v = utf8.encode(value);
+    b.addByte(tag);
+    b.add(_u16(n.length));
+    b.add(n);
+    b.add(_u16(v.length));
+    b.add(v);
+  }
+
+  attr(0x47, 'attributes-charset', 'utf-8');
+  attr(0x48, 'attributes-natural-language', 'en');
+  attr(0x45, 'printer-uri', uri);
+  attr(0x44, 'requested-attributes', 'document-format-supported');
+  b.addByte(0x03);
+  return b.toBytes();
+}
+
+Future<bool> probeIpp(Printer p) async {
+  final port = p.ippPort;
+  if (port == null) return false;
+  for (final path in {p.ippPath, 'ipp/print', 'ipp', 'ipp/printer'}) {
+    try {
+      final res = await http
+          .post(Uri.parse('http://${p.host}:$port/$path'),
+              headers: {'Content-Type': 'application/ipp'},
+              body: _buildGetAttrs('ipp://${p.host}:$port/$path'))
+          .timeout(const Duration(seconds: 4));
+      if (res.statusCode == 200 && res.bodyBytes.length > 3 && res.bodyBytes[2] == 0) {
+        p.ippPath = path;
+        final text = latin1.decode(res.bodyBytes, allowInvalid: true);
+        for (final f in [
+          'application/pdf',
+          'image/jpeg',
+          'image/png',
+          'application/octet-stream'
+        ]) {
+          if (text.contains(f)) p.formats.add(f);
+        }
+        return true;
+      }
+    } catch (_) {}
+  }
+  return false;
+}
+
+// eSCL announce na ho tab bhi port 80 par scanner dhundho
+Future<void> probeScan(Printer p) async {
+  if (p.canScan) return;
+  for (final path in ['eSCL', 'escl']) {
+    try {
+      final r = await http
+          .get(Uri.parse('http://${p.host}/$path/ScannerCapabilities'))
+          .timeout(const Duration(seconds: 3));
+      if (r.statusCode == 200 && r.body.contains('ScannerCapabilities')) {
+        p.scanPort = 80;
+        p.scanPath = path;
+        return;
+      }
+    } catch (_) {}
+  }
+}
+
+// IP se printer add karo
+Future<Printer?> addByIp(String ip) async {
+  final p = Printer('Printer $ip', ip)..ippPort = 631;
+  if (!await probeIpp(p)) p.ippPort = null;
+  await probeScan(p);
+  return (p.canPrint || p.canScan) ? p : null;
 }
 
 // ---------- 3. eSCL Scan ----------
@@ -323,6 +422,38 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  Future<void> addIpDialog() async {
+    final c = TextEditingController();
+    final ip = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Printer ka IP'),
+        content: TextField(
+          controller: c,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          decoration: const InputDecoration(hintText: '192.168.29.50'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(ctx, c.text.trim()), child: const Text('Add')),
+        ],
+      ),
+    );
+    if (ip == null || ip.isEmpty || !mounted) return;
+    setState(() { busy = true; status = '$ip check ho raha hai...'; });
+    final p = await addByIp(ip);
+    setState(() {
+      busy = false;
+      if (p == null) {
+        status = '$ip par printer ka jawab nahi aaya (IPP band ho sakta hai)';
+      } else {
+        printers = [...printers.where((x) => x.host != ip), p];
+        selected = p;
+        status = 'Add ho gaya ✅';
+      }
+    });
+  }
+
   void pickPrinter() {
     showModalBottomSheet(
       context: context,
@@ -362,6 +493,15 @@ class _HomePageState extends State<HomePage> {
                     },
                   ),
               ]),
+            ),
+            const Divider(height: 1),
+            ListTile(
+              leading: const Icon(Icons.add),
+              title: const Text('IP se add karo'),
+              onTap: () {
+                Navigator.pop(ctx);
+                addIpDialog();
+              },
             ),
           ]),
         ),
