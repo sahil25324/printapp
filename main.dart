@@ -4,51 +4,72 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:multicast_dns/multicast_dns.dart';
+import 'package:pdf/pdf.dart';
+import 'package:pdf/widgets.dart' as pw;
 
 void main() => runApp(const MaterialApp(home: HomePage()));
 
 class Printer {
-  final String name, host, path;
-  final int port;
-  Printer(this.name, this.host, this.port, this.path);
+  final String name, host;
+  int? ippPort, scanPort;
+  String ippPath = 'ipp/print', scanPath = 'eSCL';
+  Printer(this.name, this.host);
+  bool get canPrint => ippPort != null;
+  bool get canScan => scanPort != null;
 }
 
 // ---------- 1. Discovery (mDNS / Bonjour) ----------
 Stream<T> _limit<T>(Stream<T> s) =>
     s.timeout(const Duration(seconds: 4), onTimeout: (sink) => sink.close());
 
-Future<List<Printer>> discoverPrinters() async {
-  final found = <String, Printer>{};
+String _clean(String p) => p.replaceAll(RegExp(r'^/+|/+$'), '');
+
+Future<void> _browse(MDnsClient client, String service, String txtKey,
+    void Function(String name, String host, int port, String path) onFound) async {
+  await for (final ptr in _limit(client.lookup<PtrResourceRecord>(
+      ResourceRecordQuery.serverPointer(service)))) {
+    final name = ptr.domainName.split('._').first;
+    var path = '';
+
+    await for (final txt in _limit(client.lookup<TxtResourceRecord>(
+        ResourceRecordQuery.text(ptr.domainName)))) {
+      for (final line in txt.text.split('\n')) {
+        if (line.startsWith('$txtKey=')) path = _clean(line.substring(txtKey.length + 1));
+      }
+      break;
+    }
+
+    await for (final srv in _limit(client.lookup<SrvResourceRecord>(
+        ResourceRecordQuery.service(ptr.domainName)))) {
+      await for (final ip in _limit(client.lookup<IPAddressResourceRecord>(
+          ResourceRecordQuery.addressIPv4(srv.target)))) {
+        onFound(name, ip.address.address, srv.port, path);
+        break;
+      }
+      break;
+    }
+  }
+}
+
+Future<List<Printer>> discover() async {
+  final byHost = <String, Printer>{};
   final client = MDnsClient();
   await client.start();
   try {
-    await for (final ptr in _limit(client.lookup<PtrResourceRecord>(
-        ResourceRecordQuery.serverPointer('_ipp._tcp.local')))) {
-      final name = ptr.domainName.split('._ipp').first;
-      var path = 'ipp/print';
-
-      await for (final txt in _limit(client.lookup<TxtResourceRecord>(
-          ResourceRecordQuery.text(ptr.domainName)))) {
-        for (final line in txt.text.split('\n')) {
-          if (line.startsWith('rp=')) path = line.substring(3);
-        }
-        break;
-      }
-
-      await for (final srv in _limit(client.lookup<SrvResourceRecord>(
-          ResourceRecordQuery.service(ptr.domainName)))) {
-        await for (final ip in _limit(client.lookup<IPAddressResourceRecord>(
-            ResourceRecordQuery.addressIPv4(srv.target)))) {
-          found[name] = Printer(name, ip.address.address, srv.port, path);
-          break;
-        }
-        break;
-      }
-    }
+    await _browse(client, '_ipp._tcp.local', 'rp', (n, h, port, path) {
+      final p = byHost.putIfAbsent(h, () => Printer(n, h));
+      p.ippPort = port;
+      if (path.isNotEmpty) p.ippPath = path;
+    });
+    await _browse(client, '_uscan._tcp.local', 'rs', (n, h, port, path) {
+      final p = byHost.putIfAbsent(h, () => Printer(n, h));
+      p.scanPort = port;
+      if (path.isNotEmpty) p.scanPath = path;
+    });
   } finally {
     client.stop();
   }
-  return found.values.toList();
+  return byHost.values.toList();
 }
 
 // ---------- 2. IPP Print-Job ----------
@@ -83,9 +104,10 @@ Future<bool> printFile(Printer p, String ext, Uint8List bytes) async {
     'png' => 'image/png',
     _ => 'image/jpeg',
   };
-  final body = buildPrintJob('ipp://${p.host}:${p.port}/${p.path}', format, bytes);
+  final path = '${p.ippPort}/${p.ippPath}';
+  final body = buildPrintJob('ipp://${p.host}:$path', format, bytes);
   final res = await http.post(
-    Uri.parse('http://${p.host}:${p.port}/${p.path}'),
+    Uri.parse('http://${p.host}:$path'),
     headers: {'Content-Type': 'application/ipp'},
     body: body,
   );
@@ -93,7 +115,68 @@ Future<bool> printFile(Printer p, String ext, Uint8List bytes) async {
   return res.statusCode == 200 && res.bodyBytes.length > 3 && res.bodyBytes[2] == 0;
 }
 
-// ---------- 3. UI ----------
+// ---------- 3. eSCL Scan ----------
+const _scanXml = '''<?xml version="1.0" encoding="UTF-8"?>
+<scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
+  <pwg:Version>2.1</pwg:Version>
+  <pwg:ScanRegions>
+    <pwg:ScanRegion>
+      <pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits>
+      <pwg:Width>2481</pwg:Width>
+      <pwg:Height>3507</pwg:Height>
+      <pwg:XOffset>0</pwg:XOffset>
+      <pwg:YOffset>0</pwg:YOffset>
+    </pwg:ScanRegion>
+  </pwg:ScanRegions>
+  <pwg:InputSource>Platen</pwg:InputSource>
+  <scan:ColorMode>RGB24</scan:ColorMode>
+  <scan:XResolution>300</scan:XResolution>
+  <scan:YResolution>300</scan:YResolution>
+  <pwg:DocumentFormat>image/jpeg</pwg:DocumentFormat>
+</scan:ScanSettings>''';
+
+Future<Uint8List> scanPage(Printer p) async {
+  final base = 'http://${p.host}:${p.scanPort}/${p.scanPath}';
+  final res = await http.post(
+    Uri.parse('$base/ScanJobs'),
+    headers: {'Content-Type': 'text/xml'},
+    body: _scanXml,
+  );
+  if (res.statusCode != 201) {
+    throw Exception('Scan job reject hui (${res.statusCode})');
+  }
+  final loc = res.headers['location'];
+  if (loc == null) throw Exception('Printer ne job ka address nahi diya');
+
+  var path = Uri.parse(loc).path;
+  if (path.endsWith('/')) path = path.substring(0, path.length - 1);
+  final docUri = Uri(
+      scheme: 'http', host: p.host, port: p.scanPort, path: '$path/NextDocument');
+
+  for (var i = 0; i < 25; i++) {
+    final r = await http.get(docUri);
+    if (r.statusCode == 200) return r.bodyBytes;
+    if (r.statusCode == 503) {
+      await Future.delayed(const Duration(milliseconds: 1500)); // scanner busy
+      continue;
+    }
+    throw Exception('Scan nahi hua (${r.statusCode})');
+  }
+  throw Exception('Timeout: scan nahi aaya');
+}
+
+Future<Uint8List> jpegToPdf(Uint8List jpg) async {
+  final doc = pw.Document();
+  final img = pw.MemoryImage(jpg);
+  doc.addPage(pw.Page(
+    pageFormat: PdfPageFormat.a4,
+    margin: pw.EdgeInsets.zero,
+    build: (_) => pw.Center(child: pw.Image(img, fit: pw.BoxFit.contain)),
+  ));
+  return doc.save();
+}
+
+// ---------- 4. UI ----------
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
   @override
@@ -103,17 +186,23 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   List<Printer> printers = [];
   Printer? selected;
+  Uint8List? scanned;
   bool busy = false;
   String status = 'Printer search karo';
 
   Future<void> search() async {
     setState(() { busy = true; status = 'Dhundh raha hai...'; });
-    final list = await discoverPrinters();
-    setState(() {
-      printers = list;
-      busy = false;
-      status = list.isEmpty ? 'Koi printer nahi mila' : '${list.length} printer mile';
-    });
+    try {
+      final list = await discover();
+      setState(() {
+        printers = list;
+        selected = null;
+        status = list.isEmpty ? 'Koi printer nahi mila' : '${list.length} printer mile';
+      });
+    } catch (e) {
+      setState(() => status = 'Error: $e');
+    }
+    setState(() => busy = false);
   }
 
   Future<void> doPrint() async {
@@ -133,6 +222,32 @@ class _HomePageState extends State<HomePage> {
     setState(() => busy = false);
   }
 
+  Future<void> doScan() async {
+    final p = selected;
+    if (p == null) return;
+    setState(() { busy = true; status = 'Scan ho raha hai... (page glass par rakho)'; });
+    try {
+      final img = await scanPage(p);
+      setState(() { scanned = img; status = 'Scan ho gaya ✅'; });
+    } catch (e) {
+      setState(() => status = 'Error: $e');
+    }
+    setState(() => busy = false);
+  }
+
+  Future<void> savePdf() async {
+    final img = scanned;
+    if (img == null) return;
+    try {
+      final pdf = await jpegToPdf(img);
+      final path = await FilePicker.platform.saveFile(
+          dialogTitle: 'PDF save karo', fileName: 'scan.pdf', bytes: pdf);
+      setState(() => status = path == null ? 'Save cancel hua' : 'PDF save ho gayi ✅');
+    } catch (e) {
+      setState(() => status = 'Error: $e');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -145,19 +260,39 @@ class _HomePageState extends State<HomePage> {
               for (final p in printers)
                 ListTile(
                   title: Text(p.name),
-                  subtitle: Text('${p.host}:${p.port}'),
+                  subtitle: Text(
+                      '${p.host}  •  Print ${p.canPrint ? "✓" : "✗"}  •  Scan ${p.canScan ? "✓" : "✗"}'),
                   selected: selected == p,
                   onTap: () => setState(() => selected = p),
                 ),
             ],
           ),
         ),
+        if (scanned != null)
+          SizedBox(height: 220, child: Image.memory(scanned!)),
         Padding(
           padding: const EdgeInsets.all(12),
-          child: Row(children: [
-            Expanded(child: ElevatedButton(onPressed: busy ? null : search, child: const Text('Search'))),
-            const SizedBox(width: 8),
-            Expanded(child: ElevatedButton(onPressed: busy || selected == null ? null : doPrint, child: const Text('Print'))),
+          child: Column(children: [
+            Row(children: [
+              Expanded(child: ElevatedButton(onPressed: busy ? null : search, child: const Text('Search'))),
+              const SizedBox(width: 8),
+              Expanded(
+                  child: ElevatedButton(
+                      onPressed: busy || !(selected?.canPrint ?? false) ? null : doPrint,
+                      child: const Text('Print'))),
+              const SizedBox(width: 8),
+              Expanded(
+                  child: ElevatedButton(
+                      onPressed: busy || !(selected?.canScan ?? false) ? null : doScan,
+                      child: const Text('Scan'))),
+            ]),
+            if (scanned != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton(onPressed: savePdf, child: const Text('Save as PDF'))),
+              ),
           ]),
         ),
       ]),
