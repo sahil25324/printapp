@@ -1,4 +1,6 @@
 import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -241,6 +243,50 @@ Future<Printer?> addByIp(String ip) async {
   return (p.canPrint || p.canScan) ? p : null;
 }
 
+// ---------- Poora network scan (Bonjour ke bina bhi printers dhundho) ----------
+Future<bool> _portOpen(String host, int port) async {
+  try {
+    final s = await Socket.connect(host, port, timeout: const Duration(milliseconds: 700));
+    s.destroy();
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+Future<List<Printer>> scanNetwork() async {
+  final found = <Printer>[];
+  String? prefix;
+  for (final ni in await NetworkInterface.list(type: InternetAddressType.IPv4)) {
+    for (final a in ni.addresses) {
+      final ip = a.address;
+      if (ip.startsWith('192.168.') || ip.startsWith('10.') || ip.startsWith('172.')) {
+        prefix = ip.substring(0, ip.lastIndexOf('.'));
+        break;
+      }
+    }
+    if (prefix != null) break;
+  }
+  if (prefix == null) return found;
+
+  final hosts = [for (var i = 1; i < 255; i++) '$prefix.$i'];
+  for (var i = 0; i < hosts.length; i += 64) {
+    final batch = hosts.sublist(i, min(i + 64, hosts.length));
+    await Future.wait(batch.map((h) async {
+      if (await _portOpen(h, 631)) {
+        final p = Printer('Printer $h', h)..ippPort = 631;
+        if (!await probeIpp(p)) p.ippPort = null;
+        await probeScan(p);
+        found.add(p);
+      } else if (await _portOpen(h, 9100)) {
+        // sirf RAW port khula hai: printer hai, par abhi app isse print nahi kar sakti
+        found.add(Printer('Printer $h (sirf RAW 9100)', h));
+      }
+    }));
+  }
+  return found;
+}
+
 // ---------- 3. eSCL Scan ----------
 const _scanXml = '''<?xml version="1.0" encoding="UTF-8"?>
 <scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
@@ -422,6 +468,28 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  Future<void> networkScan() async {
+    setState(() { busy = true; status = 'Network scan ho raha hai... (~30 sec)'; });
+    try {
+      final found = await scanNetwork();
+      setState(() {
+        final byHost = {for (final p in printers) p.host: p};
+        for (final f in found) {
+          final old = byHost[f.host];
+          if (old == null || f.canPrint || f.canScan) byHost[f.host] = f;
+        }
+        printers = byHost.values.toList();
+        selected = selected == null ? null : byHost[selected!.host];
+        status = found.isEmpty
+            ? 'Network par koi printer nahi mila'
+            : '${found.length} device mile, list kholo';
+      });
+    } catch (e) {
+      setState(() => status = 'Error: $e');
+    }
+    setState(() => busy = false);
+  }
+
   Future<void> addIpDialog() async {
     final c = TextEditingController();
     final ip = await showDialog<String>(
@@ -495,6 +563,14 @@ class _HomePageState extends State<HomePage> {
               ]),
             ),
             const Divider(height: 1),
+            ListTile(
+              leading: const Icon(Icons.radar),
+              title: const Text('Poora network scan karo'),
+              onTap: () {
+                Navigator.pop(ctx);
+                networkScan();
+              },
+            ),
             ListTile(
               leading: const Icon(Icons.add),
               title: const Text('IP se add karo'),
