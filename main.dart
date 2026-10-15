@@ -5,16 +5,22 @@ import 'dart:typed_data';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart';
 import 'package:multicast_dns/multicast_dns.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
+
+// Printers ke self-signed https certificate ko accept karne wala client
+final http.Client _insecure = IOClient(HttpClient()
+  ..badCertificateCallback = (cert, host, port) => true
+  ..connectionTimeout = const Duration(seconds: 5));
 
 void main() => runApp(const MaterialApp(home: HomePage()));
 
 class Printer {
   final String name, host;
   int? ippPort, scanPort;
-  String ippPath = 'ipp/print', scanPath = 'eSCL';
+  String ippPath = 'ipp/print', scanPath = 'eSCL', scanScheme = 'http';
   final formats = <String>{}; // printer jo file types leta hai
   Printer(this.name, this.host);
   bool get canPrint => ippPort != null;
@@ -68,6 +74,14 @@ Future<List<Printer>> discover() async {
       final p = byHost.putIfAbsent(h, () => Printer(n, h));
       p.scanPort = port;
       if (path.isNotEmpty) p.scanPath = path;
+    });
+    await _browse(client, '_uscans._tcp.local', 'rs', (n, h, port, path) {
+      final p = byHost.putIfAbsent(h, () => Printer(n, h));
+      if (!p.canScan) {
+        p.scanPort = port;
+        p.scanScheme = 'https';
+        if (path.isNotEmpty) p.scanPath = path;
+      }
     });
   } finally {
     client.stop();
@@ -221,17 +235,20 @@ Future<bool> probeIpp(Printer p) async {
 // eSCL announce na ho tab bhi port 80 par scanner dhundho
 Future<void> probeScan(Printer p) async {
   if (p.canScan) return;
-  for (final path in ['eSCL', 'escl']) {
-    try {
-      final r = await http
-          .get(Uri.parse('http://${p.host}/$path/ScannerCapabilities'))
-          .timeout(const Duration(seconds: 3));
-      if (r.statusCode == 200 && r.body.contains('ScannerCapabilities')) {
-        p.scanPort = 80;
-        p.scanPath = path;
-        return;
-      }
-    } catch (_) {}
+  for (final t in [('http', 80), ('https', 443)]) {
+    for (final path in ['eSCL', 'escl']) {
+      try {
+        final r = await _insecure
+            .get(Uri.parse('${t.$1}://${p.host}:${t.$2}/$path/ScannerCapabilities'))
+            .timeout(const Duration(seconds: 3));
+        if (r.statusCode == 200 && r.body.contains('ScannerCapabilities')) {
+          p.scanScheme = t.$1;
+          p.scanPort = t.$2;
+          p.scanPath = path;
+          return;
+        }
+      } catch (_) {}
+    }
   }
 }
 
@@ -287,6 +304,30 @@ Future<List<Printer>> scanNetwork() async {
   return found;
 }
 
+// ---------- Printer check: kaun se ports/protocols khule hain ----------
+Future<String> diagnose(Printer p) async {
+  const checks = {
+    80: 'Web page / eSCL (http)',
+    443: 'Web page / eSCL (https)',
+    631: 'IPP print',
+    5357: 'WSD (Windows scan/print)',
+    1865: 'Epson scan (ESC/I-2)',
+    8612: 'Canon BJNP (scan/print)',
+    9100: 'RAW print',
+    515: 'LPD print',
+    445: 'SMB (scan to folder)',
+  };
+  final res = await Future.wait(
+      checks.keys.map((port) async => MapEntry(port, await _portOpen(p.host, port))));
+  final b = StringBuffer('IP: ${p.host}\n\n');
+  for (final e in res) {
+    b.writeln('${e.value ? "✓" : "✗"}  ${e.key}  ${checks[e.key]}');
+  }
+  b.writeln('\nPrint (IPP): ${p.canPrint ? "✓" : "✗"}');
+  b.writeln('Scan (eSCL): ${p.canScan ? "✓ ${p.scanScheme}:${p.scanPort}" : "✗ nahi mila"}');
+  return b.toString();
+}
+
 // ---------- 3. eSCL Scan ----------
 const _scanXml = '''<?xml version="1.0" encoding="UTF-8"?>
 <scan:ScanSettings xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
@@ -308,8 +349,8 @@ const _scanXml = '''<?xml version="1.0" encoding="UTF-8"?>
 </scan:ScanSettings>''';
 
 Future<Uint8List> scanPage(Printer p) async {
-  final base = 'http://${p.host}:${p.scanPort}/${p.scanPath}';
-  final res = await http.post(
+  final base = '${p.scanScheme}://${p.host}:${p.scanPort}/${p.scanPath}';
+  final res = await _insecure.post(
     Uri.parse('$base/ScanJobs'),
     headers: {'Content-Type': 'text/xml'},
     body: _scanXml,
@@ -323,10 +364,10 @@ Future<Uint8List> scanPage(Printer p) async {
   var path = Uri.parse(loc).path;
   if (path.endsWith('/')) path = path.substring(0, path.length - 1);
   final docUri = Uri(
-      scheme: 'http', host: p.host, port: p.scanPort, path: '$path/NextDocument');
+      scheme: p.scanScheme, host: p.host, port: p.scanPort, path: '$path/NextDocument');
 
   for (var i = 0; i < 25; i++) {
-    final r = await http.get(docUri);
+    final r = await _insecure.get(docUri);
     if (r.statusCode == 200) return r.bodyBytes;
     if (r.statusCode == 503) {
       await Future.delayed(const Duration(milliseconds: 1500)); // scanner busy
@@ -468,6 +509,27 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  Future<void> runDiagnose() async {
+    final p = selected;
+    if (p == null) {
+      setState(() => status = 'Pehle neeche se printer chuno');
+      pickPrinter();
+      return;
+    }
+    setState(() { busy = true; status = 'Printer check ho raha hai...'; });
+    final text = await diagnose(p);
+    setState(() => busy = false);
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(p.name),
+        content: SingleChildScrollView(child: Text(text)),
+        actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK'))],
+      ),
+    );
+  }
+
   Future<void> networkScan() async {
     setState(() { busy = true; status = 'Network scan ho raha hai... (~30 sec)'; });
     try {
@@ -602,7 +664,16 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     final p = selected;
     return Scaffold(
-      appBar: AppBar(title: const Text('Wi-Fi Print & Scan')),
+      appBar: AppBar(
+        title: const Text('Wi-Fi Print & Scan'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.fact_check_outlined),
+            tooltip: 'Printer check',
+            onPressed: busy ? null : runDiagnose,
+          ),
+        ],
+      ),
       body: ListView(
         padding: const EdgeInsets.all(12),
         children: [
